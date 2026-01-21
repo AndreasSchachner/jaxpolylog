@@ -7,7 +7,7 @@ setup(
     author='Andreas Schachner',
     author_email='andreas.schachner@gmx.de',
     packages=['jaxpolylog'],
-    python_requires='>=3.8',
+    python_requires='>=3.12',
     install_requires=[
         'numpy',
         'jax',
