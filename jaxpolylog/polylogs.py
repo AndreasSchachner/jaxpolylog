@@ -136,8 +136,7 @@ def jax_polylog_fwd(z: complex,s: int,p_range: int) -> tuple:
             - tuple: A tuple of residuals needed for the backward pass.
     """
     
-# Returns primal output and residuals to be used in backward pass by f_bwd.
-    #return jax_polylog(z,s,p_range), (jax_polylog(z,s-1,p_range)/z,0,0) return jax_polylog(z,s,p_range), (jax_polylog(z,s-1,p_range)/z,0.+0*0j,0+0.*0j)
+    # Returns primal output and residuals to be used in backward pass by f_bwd.
     return jax_polylog(z,s,p_range), (jax_polylog(z,s-1,p_range)/z,0.+0*0j,0+0.*0j)
 
 def jax_polylog_bwd(s: int,p_range: int,res: tuple, g: ArrayLike) -> tuple:
@@ -154,11 +153,7 @@ def jax_polylog_bwd(s: int,p_range: int,res: tuple, g: ArrayLike) -> tuple:
     Returns:
         tuple: A tuple containing the gradient of the input `z`.
     """
-# Returns the cotangent of the primal inputs and the residuals from f_fwd.
-    #g is the cotangent of the output
-    #res contains the residuals computed in f_fwd
-    #return (g * res[0],0,0) # Derivative w.rt. z, s, p_range
-    #return (g * res[0],0+0*0j,0+0.*0j) # Derivative w.rt. z, s, p_range        
+    # Returns the cotangent of the primal inputs and the residuals from f_fwd.  
     y, _,_ = res # Gets residuals computed in f_fwd
     return ((g * y+0.*0j,))
 
@@ -169,6 +164,7 @@ jax_polylog_vmap_tmp = jax.vmap(jax_polylog,in_axes=(0,None,None))
 @partial(jit, static_argnames=['s','p_range'])
 def jax_polylog_vmap(z: complex,s: int,p_range: int) -> complex:
     r"""
+    **Description:**
     Vectorized version of the polylogarithm function using JAX's vmap.
     
     Args:
