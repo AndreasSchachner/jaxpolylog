@@ -43,9 +43,9 @@ def intgrand(z: complex, t: complex, s: int) -> complex:
     return jnp.log(t)**(s-1)/(1-z*t)
 
 
-@partial(custom_vjp, nondiff_argnums=(1,2,))
-@partial(jit, static_argnums=(1,2,))
-def jax_polylog(z: complex, s: int, p_range: int) -> complex:
+@partial(custom_vjp, nondiff_argnums=(1,2,3,))
+@partial(jit, static_argnums=(1,2,3,))
+def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex:
     r"""
     **Description:**
     This function computes the polylogarithm of order `s` at point `z` using JAX. It supports automatic differentiation and is optimized for performance. The function is defined for integer values of `s` and can handle both real and complex inputs for `z`. 
@@ -75,6 +75,7 @@ def jax_polylog(z: complex, s: int, p_range: int) -> complex:
         z (complex): The input value(s) at which to evaluate the polylogarithm. Can be a scalar or an array.
         s (int): The order of the polylogarithm. Must be an integer.
         p_range (int): The number of terms to include in the series expansion for non-predefined `s` values. Higher values increase accuracy but also computation time.
+        approx (str): The approximation method to use. Must be one of "inf", "integral", or "zero".
         
     Returns:
         complex: The computed polylogarithm values at the input `z`.
@@ -93,6 +94,10 @@ def jax_polylog(z: complex, s: int, p_range: int) -> complex:
     # Check if s is an integer
     if not isinstance(s, int):
         raise ValueError("The order 's' must be an integer.")
+    
+    if approx not in ["inf","integral","zero"]:
+        raise ValueError("The approximation method must be one of 'inf', 'integral', or 'zero'.")
+    
     # Handle special cases for specific integer values of s
     if s==1:
         return -jnp.log(1-z)
@@ -117,10 +122,45 @@ def jax_polylog(z: complex, s: int, p_range: int) -> complex:
     elif s==-9:
         return (z*(1 + 502*z + 14608*z**2 + 88234*z**3 + 156190*z**4 + 88234*z**5 + 14608*z**6 + 502*z**7 + z**8))/(-1 + z)**10
     else:
-        polylog_range = jnp.arange(1,p_range)
-        return jnp.sum(z**polylog_range/polylog_range**s)
+        if approx=="inf":
+            # Use series definition around z=infty
+            polylog_range = jnp.arange(1,p_range)
+            return jnp.sum(z**polylog_range/polylog_range**s)
+        elif approx=="integral":
+            # Use integral representation
+            polylog_range = jnp.linspace(0+1e-20,1.,p_range)
+            return z*(-1)**(s-1)/jax.scipy.special.gamma(s)*jax.scipy.integrate.trapezoid(intgrand(z,polylog_range,s),x=polylog_range)
+        elif approx=="zero":
+            # Use series expansion around z=0
+            mu = jnp.log(z)
+            Hs = jnp.sum(1/jnp.arange(1,s))
+            term1 = (mu)**(s-1)/jax.scipy.special.gamma(s)*(Hs-jnp.log(-mu))
 
-def jax_polylog_fwd(z: complex,s: int,p_range: int) -> tuple:
+            # Values of zeta function from s to 2
+            zeta_pos = jax.scipy.special.zeta(s-jnp.arange(0,s-1),q=1)
+            zeta = jnp.append(zeta_pos,jnp.zeros(1))
+
+            # Values of zeta function from 0 to -p_range
+            Bs = jax.scipy.special.bernoulli(p_range)[1:]
+            Bs = Bs.at[0].set(0.5)
+            zneg_range = jnp.arange(1,p_range+1)
+            zeta_neg = -Bs/zneg_range
+
+            # Combine both parts
+            zeta = jnp.append(zeta,zeta_neg)
+            
+            # Set coefficient at s-1 to zero
+            zeta = zeta.at[s-1].set(0.)
+            polylog_range = jnp.arange(0,zeta.shape[0])
+            
+            # Compute coefficients
+            coeffs = zeta/jax.scipy.special.factorial(polylog_range)
+
+            # Compute series
+            term2 = jnp.sum(coeffs*mu**polylog_range)
+            return term1 + term2
+
+def jax_polylog_fwd(z: complex,s: int,p_range: int, approx: str) -> tuple:
     r"""
     **Description:**
     Forward pass for the custom VJP of the polylogarithm function.
@@ -129,6 +169,7 @@ def jax_polylog_fwd(z: complex,s: int,p_range: int) -> tuple:
         z (complex): The input value(s) at which to evaluate the polylogarithm. Can be a scalar or an array.
         s (int): The order of the polylogarithm. Must be an integer.
         p_range (int): The number of terms to include in the series expansion for non-predefined `s` values. Higher values increase accuracy but also computation time.
+        approx (str): The approximation method to use. Must be one of "inf", "integral", or "zero".
         
     Returns:
         tuple: A tuple containing:
@@ -137,9 +178,9 @@ def jax_polylog_fwd(z: complex,s: int,p_range: int) -> tuple:
     """
     
     # Returns primal output and residuals to be used in backward pass by f_bwd.
-    return jax_polylog(z,s,p_range), (jax_polylog(z,s-1,p_range)/z,0.+0*0j,0+0.*0j)
+    return jax_polylog(z,s,p_range,approx), (jax_polylog(z,s-1,p_range,approx)/z,0.+0*0j,0+0.*0j,0+0.*0j)
 
-def jax_polylog_bwd(s: int,p_range: int,res: tuple, g: ArrayLike) -> tuple:
+def jax_polylog_bwd(s: int, p_range: int, approx: str, res: tuple, g: ArrayLike) -> tuple:
     r"""
     **Description:**
     Backward pass for the custom VJP of the polylogarithm function.
@@ -147,6 +188,7 @@ def jax_polylog_bwd(s: int,p_range: int,res: tuple, g: ArrayLike) -> tuple:
     Args:
         s (int): The order of the polylogarithm. Must be an integer.
         p_range (int): The number of terms to include in the series expansion for non-predefined `s` values. Higher values increase accuracy but also computation time.
+        approx (str): The approximation method to use. Must be one of "inf", "integral", or "zero".
         res (tuple): A tuple of residuals from the forward pass.
         g (ArrayLike): The gradient of the output with respect to some scalar value.
         
@@ -154,15 +196,15 @@ def jax_polylog_bwd(s: int,p_range: int,res: tuple, g: ArrayLike) -> tuple:
         tuple: A tuple containing the gradient of the input `z`.
     """
     # Returns the cotangent of the primal inputs and the residuals from f_fwd.  
-    y, _,_ = res # Gets residuals computed in f_fwd
+    y, _,_,_ = res # Gets residuals computed in f_fwd
     return ((g * y+0.*0j,))
 
 jax_polylog.defvjp(jax_polylog_fwd, jax_polylog_bwd)
 
-jax_polylog_vmap_tmp = jax.vmap(jax_polylog,in_axes=(0,None,None))
+jax_polylog_vmap_tmp = jax.vmap(jax_polylog,in_axes=(0,None,None,None))
 
-@partial(jit, static_argnames=['s','p_range'])
-def jax_polylog_vmap(z: complex,s: int,p_range: int) -> complex:
+@partial(jit, static_argnames=['s','p_range','approx'])
+def jax_polylog_vmap(z: complex,s: int,p_range: int,approx: str="inf") -> complex:
     r"""
     **Description:**
     Vectorized version of the polylogarithm function using JAX's vmap.
@@ -171,12 +213,13 @@ def jax_polylog_vmap(z: complex,s: int,p_range: int) -> complex:
         z (complex): The input values at which to evaluate the polylogarithm. Must be a 1D array.
         s (int): The order of the polylogarithm. Must be an integer.
         p_range (int): The number of terms to include in the series expansion for non-predefined `s` values. Higher values increase accuracy but also computation time.
+        approx (str, optional): The approximation method to use. Must be one of "inf", "integral", or "zero".
         
     Returns:
         complex: The computed polylogarithm values at the input `z`.
     """
     
-    return jax_polylog_vmap_tmp(z,s,p_range)
+    return jax_polylog_vmap_tmp(z,s,p_range,approx)
 
 
 
