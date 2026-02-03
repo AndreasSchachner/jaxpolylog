@@ -40,12 +40,12 @@ def intgrand(z: complex, t: complex, s: int) -> complex:
         complex: The computed integrand values.
     
     """
-    return jnp.log(t)**(s-1)/(1-z*t)
+    return jnp.log(t)**(s-1)/(1-z*t) # type: ignore
 
 
 @partial(custom_vjp, nondiff_argnums=(1,2,3,))
 @partial(jit, static_argnums=(1,2,3,))
-def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex:
+def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex: # type: ignore
     r"""
     **Description:**
     This function computes the polylogarithm of order `s` at point `z` using JAX. It supports automatic differentiation and is optimized for performance. The function is defined for integer values of `s` and can handle both real and complex inputs for `z`. 
@@ -80,6 +80,9 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex:
     Returns:
         complex: The computed polylogarithm values at the input `z`.
         
+    Raises:
+        ValueError: If `s` is not an integer or if `approx` is not one of the specified methods.
+        
     **Example Usage:**
     ```python
     import jax.numpy as jnp
@@ -100,7 +103,7 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex:
     
     # Handle special cases for specific integer values of s
     if s==1:
-        return -jnp.log(1-z)
+        return -jnp.log(1-z) # type: ignore
     elif s==0:
         return z/(1-z)
     elif s==-1:
@@ -125,7 +128,7 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex:
         if approx=="inf":
             # Use series definition around z=infty
             polylog_range = jnp.arange(1,p_range)
-            return jnp.sum(z**polylog_range/polylog_range**s)
+            return jnp.sum(z**polylog_range/polylog_range**s) # type: ignore
         elif approx=="integral":
             # Use integral representation
             polylog_range = jnp.linspace(0+1e-20,1.,p_range)
@@ -158,7 +161,7 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex:
 
             # Compute series
             term2 = jnp.sum(coeffs*mu**polylog_range)
-            return term1 + term2
+            return term1 + term2 # type: ignore
 
 def jax_polylog_fwd(z: complex,s: int,p_range: int, approx: str) -> tuple:
     r"""
