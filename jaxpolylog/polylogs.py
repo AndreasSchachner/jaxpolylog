@@ -136,16 +136,20 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex: # typ
         elif approx=="zero":
             # Use series expansion around z=0
             mu = jnp.log(z)
+            # Compute harmonic number
             Hs = jnp.sum(1/jnp.arange(1,s))
+            # First term
             term1 = (mu)**(s-1)/jax.scipy.special.gamma(s)*(Hs-jnp.log(-mu))
 
             # Values of zeta function from s to 2
             zeta_pos = jax.scipy.special.zeta(s-jnp.arange(0,s-1),q=1)
             zeta = jnp.append(zeta_pos,jnp.zeros(1))
 
-            # Values of zeta function from 0 to -p_range
+            # Values of Bernoulli numbers from 1 to p_range
             Bs = jax.scipy.special.bernoulli(p_range)[1:]
+            # Change convention for B_1
             Bs = Bs.at[0].set(0.5)
+            # Values of zeta function from 0 to -p_range
             zneg_range = jnp.arange(1,p_range+1)
             zeta_neg = -Bs/zneg_range
 
