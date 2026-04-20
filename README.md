@@ -10,11 +10,14 @@ The recommended way to install the package is via [pip](https://packaging.python
 
 Next, choose the installation method that best fits your use case:
 
-- **Editable install directly from GitHub:** 
-  If you only want to use the package or make light modifications, you can install it directly from the repository with:
-  `pip install -e git+https://github.com/AndreasSchachner/jaxpolylog.git#egg=jaxpolylog`
+- **Install from PyPI (recommended):**  
+  `pip install jaxpolylog`
 
-- **Editable install from a local clone (recommended for development):**  
+- **Install directly from GitHub:**  
+  If you want the latest development version:
+  `pip install git+https://github.com/AndreasSchachner/jaxpolylog.git`
+
+- **Install from a local clone (recommended for development):**  
   If you plan to actively develop or experiment with the code, first download or clone the repository. Then navigate to the root directory of the project in a terminal and run:
   `pip install -e .`  
   The `-e` (editable) option ensures that any local code changes take effect immediately without requiring reinstallation.

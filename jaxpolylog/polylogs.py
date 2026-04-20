@@ -25,6 +25,50 @@ from numpy.typing import ArrayLike
 # Enable 64 bit precision
 config.update("jax_enable_x64", True)
 
+
+def _compute_pval_optimal() -> float:
+    r"""
+    Find the optimal transition parameter ``t*`` for the ``"patch"`` method.
+
+    The ``"patch"`` method switches between two series expansions of Li_s(z):
+
+    * **"inf"** series: ``Li_s(z) = Σ z^k / k^s``, convergent for ``|z| < 1``.
+      After ``N`` terms the truncation error scales as ``|z|^N``.
+    * **"zero"** expansion: Laurent series in ``μ = log z`` around ``μ = 0``
+      (``z = 1``), convergent for ``|μ| < 2π``.  After ``N`` terms the error
+      scales as ``(|μ|/(2π))^N = t^N`` where ``t = |μ|/(2π)``.
+
+    For real positive ``z < 1`` both errors are equal when
+
+    .. math::
+        |z|^N = t^N \;\Longrightarrow\; |z| = t \;\Longrightarrow\;
+        e^{-|μ|} = \frac{|μ|}{2π} \;\Longrightarrow\; e^{-2πt} = t \,.
+
+    The unique positive solution of ``e^{-2πt} = t`` is computed here by
+    bisection and stored as the module constant :data:`_PVAL_OPTIMAL` ≈ 0.2322.
+    This fixed point is independent of ``N`` (the ``p_range`` parameter), so
+    the optimal crossover does not change with the number of series terms.
+
+    Returns:
+        float: Optimal transition parameter ``t*`` ≈ 0.2322.
+    """
+    import numpy as _np
+    # Bisect on f(t) = e^{-2πt} - t.  f(0.05) > 0, f(0.50) < 0.
+    lo, hi = 0.05, 0.50
+    for _ in range(80):           # 80 iterations → sub-ULP accuracy
+        mid = 0.5 * (lo + hi)
+        if _np.exp(-2.0 * _np.pi * mid) > mid:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+# Optimal patch transition: t* = |log z| / (2π) at which the truncation errors
+# of the "inf" series and the "zero" expansion are equal.  Precomputed once at
+# import time by solving e^{-2πt} = t via bisection (~0.2322).
+_PVAL_OPTIMAL: float = _compute_pval_optimal()
+
 @partial(jit, static_argnums = (2,))
 def intgrand(z: complex, t: complex, s: int) -> complex:
     r"""
@@ -43,9 +87,9 @@ def intgrand(z: complex, t: complex, s: int) -> complex:
     return jnp.log(t)**(s-1)/(1-z*t) # type: ignore
 
 
-@partial(custom_vjp, nondiff_argnums=(1,2,3,))
-@partial(jit, static_argnums=(1,2,3,))
-def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex: # type: ignore
+@partial(custom_vjp, nondiff_argnums=(1,2,3,4,))
+@partial(jit, static_argnums=(1,2,3,4,))
+def jax_polylog(z: complex, s: int, p_range: int, approx: str, pval: float = _PVAL_OPTIMAL) -> complex: # type: ignore
     r"""
     **Description:**
     This function computes the polylogarithm of order `s` at point `z` using JAX. It supports automatic differentiation and is optimized for performance. The function is defined for integer values of `s` and can handle both real and complex inputs for `z`. 
@@ -75,7 +119,14 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex: # typ
         z (complex): The input value(s) at which to evaluate the polylogarithm. Can be a scalar or an array.
         s (int): The order of the polylogarithm. Must be an integer.
         p_range (int): The number of terms to include in the series expansion for non-predefined `s` values. Higher values increase accuracy but also computation time.
-        approx (str): The approximation method to use. Must be one of "inf", "integral", or "zero".
+        approx (str): The approximation method to use. Must be one of ``"inf"``, ``"integral"``, ``"zero"``, or ``"patch"``.
+        pval (float, optional): Transition parameter for the ``"patch"`` method.
+            Points with ``t = |log z| / (2π) < pval`` use the ``"zero"`` expansion;
+            points with ``t ≥ pval`` *and* ``|z| < 1`` use the ``"inf"`` series.
+            Points with ``|z| ≥ 1`` always use ``"zero"`` (the ``"inf"`` series
+            diverges there).  The default is :data:`_PVAL_OPTIMAL` ≈ 0.2322,
+            the fixed point of ``e^{-2πt} = t`` that equates both truncation
+            errors.  Ignored for ``approx`` values other than ``"patch"``.
         
     Returns:
         complex: The computed polylogarithm values at the input `z`.
@@ -98,8 +149,8 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex: # typ
     if not isinstance(s, int):
         raise ValueError("The order 's' must be an integer.")
     
-    if approx not in ["inf","integral","zero"]:
-        raise ValueError("The approximation method must be one of 'inf', 'integral', or 'zero'.")
+    if approx not in ["inf","integral","zero","patch"]:
+        raise ValueError("The approximation method must be one of 'inf', 'integral', 'zero', or 'patch'.")
     
     # Handle special cases for specific integer values of s
     if s==1:
@@ -166,67 +217,91 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str) -> complex: # typ
             # Compute series
             term2 = jnp.sum(coeffs*mu**polylog_range)
             return term1 + term2 # type: ignore
+        elif approx=="patch":
+            # t = |log z| / (2π): normalised distance from the nearest root of
+            # unity in log-space.  The "zero" expansion converges for t < 1 and
+            # the "inf" series converges for |z| < 1.
+            mu = jnp.log(z)
+            t  = jnp.abs(mu) / (2.0 * jnp.pi)
 
-def jax_polylog_fwd(z: complex,s: int,p_range: int, approx: str) -> tuple:
+            Lis_inf  = jax_polylog(z, s, p_range, "inf",  pval)
+            Lis_zero = jax_polylog(z, s, p_range, "zero", pval)
+
+            # Use "inf" only when BOTH conditions hold:
+            #   (a) |z| < 1  — the "inf" series converges; it diverges for |z| ≥ 1
+            #   (b) t ≥ pval — the "inf" series has smaller truncation error
+            # Everything else (including all points on or outside the unit circle)
+            # falls back to the "zero" expansion.
+            inside_disk = jnp.heaviside(1.0 - jnp.abs(z), 0.0)   # 1 if |z| < 1
+            prefer_inf  = jnp.heaviside(t - pval, 0.0)            # 1 if t ≥ pval
+            w_inf  = inside_disk * prefer_inf
+            w_zero = 1.0 - w_inf
+
+            return Lis_inf * w_inf + Lis_zero * w_zero
+
+def jax_polylog_fwd(z: complex, s: int, p_range: int, approx: str, pval: float) -> tuple:
     r"""
     **Description:**
     Forward pass for the custom VJP of the polylogarithm function.
-    
+
     Args:
         z (complex): The input value(s) at which to evaluate the polylogarithm. Can be a scalar or an array.
         s (int): The order of the polylogarithm. Must be an integer.
         p_range (int): The number of terms to include in the series expansion for non-predefined `s` values. Higher values increase accuracy but also computation time.
-        approx (str): The approximation method to use. Must be one of "inf", "integral", or "zero".
-        
+        approx (str): The approximation method to use. Must be one of "inf", "integral", "zero", or "patch".
+        pval (float): Transition parameter for the "patch" method (see :func:`jax_polylog`).
+
     Returns:
         tuple: A tuple containing:
             - complex: The computed polylogarithm values at the input `z`.
             - tuple: A tuple of residuals needed for the backward pass.
     """
-    
-    # Returns primal output and residuals to be used in backward pass by f_bwd.
-    return jax_polylog(z,s,p_range,approx), (jax_polylog(z,s-1,p_range,approx)/z,0.+0*0j,0+0.*0j,0+0.*0j)
 
-def jax_polylog_bwd(s: int, p_range: int, approx: str, res: tuple, g: ArrayLike) -> tuple:
+    # Returns primal output and residuals to be used in backward pass by f_bwd.
+    return jax_polylog(z, s, p_range, approx, pval), (jax_polylog(z, s-1, p_range, approx, pval)/z, 0.+0*0j, 0+0.*0j, 0+0.*0j)
+
+def jax_polylog_bwd(s: int, p_range: int, approx: str, pval: float, res: tuple, g: ArrayLike) -> tuple:
     r"""
     **Description:**
     Backward pass for the custom VJP of the polylogarithm function.
-    
+
     Args:
         s (int): The order of the polylogarithm. Must be an integer.
         p_range (int): The number of terms to include in the series expansion for non-predefined `s` values. Higher values increase accuracy but also computation time.
-        approx (str): The approximation method to use. Must be one of "inf", "integral", or "zero".
+        approx (str): The approximation method to use. Must be one of "inf", "integral", "zero", or "patch".
+        pval (float): Transition parameter for the "patch" method (see :func:`jax_polylog`).
         res (tuple): A tuple of residuals from the forward pass.
         g (ArrayLike): The gradient of the output with respect to some scalar value.
-        
+
     Returns:
         tuple: A tuple containing the gradient of the input `z`.
     """
-    # Returns the cotangent of the primal inputs and the residuals from f_fwd.  
+    # Returns the cotangent of the primal inputs and the residuals from f_fwd.
     y, _,_,_ = res # Gets residuals computed in f_fwd
     return ((g * y+0.*0j,))
 
 jax_polylog.defvjp(jax_polylog_fwd, jax_polylog_bwd)
 
-jax_polylog_vmap_tmp = jax.vmap(jax_polylog,in_axes=(0,None,None,None))
+jax_polylog_vmap_tmp = jax.vmap(jax_polylog, in_axes=(0, None, None, None, None))
 
-@partial(jit, static_argnames=['s','p_range','approx'])
-def jax_polylog_vmap(z: complex,s: int,p_range: int,approx: str="inf") -> complex:
+@partial(jit, static_argnames=['s','p_range','approx','pval'])
+def jax_polylog_vmap(z: complex, s: int, p_range: int, approx: str = "inf", pval: float = _PVAL_OPTIMAL) -> complex:
     r"""
     **Description:**
     Vectorized version of the polylogarithm function using JAX's vmap.
-    
+
     Args:
         z (complex): The input values at which to evaluate the polylogarithm. Must be a 1D array.
         s (int): The order of the polylogarithm. Must be an integer.
         p_range (int): The number of terms to include in the series expansion for non-predefined `s` values. Higher values increase accuracy but also computation time.
-        approx (str, optional): The approximation method to use. Must be one of "inf", "integral", or "zero".
-        
+        approx (str, optional): The approximation method to use. Must be one of "inf", "integral", "zero", or "patch".  Default is ``"inf"``.
+        pval (float, optional): Transition parameter for the ``"patch"`` method.  See :func:`jax_polylog`.  Default is :data:`_PVAL_OPTIMAL`.
+
     Returns:
         complex: The computed polylogarithm values at the input `z`.
     """
-    
-    return jax_polylog_vmap_tmp(z,s,p_range,approx)
+
+    return jax_polylog_vmap_tmp(z, s, p_range, approx, pval)
 
 
 
