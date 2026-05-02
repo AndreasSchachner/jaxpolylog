@@ -269,18 +269,23 @@ def _Li_over_z(z: complex, s: int, p_range: int, approx: str, pval: float) -> co
         complex: The value :math:`\mathrm{Li}_s(z)/z` evaluated stably.
     """
     # Closed-form simplifications.  Each entry is the closed-form Li_s(z)
-    # divided by z and algebraically simplified — no division by z remains.
+    # divided by z and algebraically simplified — no division by z remains
+    # for s <= 0 (the polynomial-rational forms manifestly cancel z).
     if s == 1:
-        # Li_1(z)/z = -log(1-z)/z = sum_{k=1}^{p_range-1} z^{k-1}/k
-        # Hand-extract the k=1 constant term (= 1) and unroll the rest as a
-        # Python loop using `z**(k-1)` with STATIC integer `k-1`.  This
-        # dispatches to ``lax.integer_pow`` whose derivative rule is clean
-        # (does not introduce spurious ``0 * pow(z, -n)`` factors that would
-        # overflow at very small ``z``).
-        result = 1.0 + 0.0 * z   # k=1 term, broadcast to z's shape/dtype
-        for k in range(2, p_range):
-            result = result + z**(k - 1) / float(k)
-        return result
+        # Li_1(z)/z = -log(1-z)/z.  Use the closed form (with ``log1p`` for
+        # accuracy when ``|z|`` is small) — this matches v0.1.0's behaviour
+        # exactly and is exact at any moderate ``z``, including ``|z|`` close
+        # to 1 where the truncated Taylor series diverges from the closed
+        # form.
+        #
+        # NOTE: this expression contains an explicit ``/z``.  At very small
+        # ``|z|`` the value is fine (``log1p(-z) ≈ -z``, so the ratio is ≈ 1),
+        # but JAX's auto-diff of ``-log1p(-z)/z`` cascades ``1/z``, ``1/z²``
+        # at higher orders and overflows when ``|z|`` is tiny — same regime
+        # as v0.1.0.  In jaxvacua's F_inst chain (parent ``s=3``), only
+        # ``_Li_over_z(z, s=2, ...)`` is invoked, so this branch is never
+        # hit during higher-order autodiff and the overflow is avoided.
+        return -jnp.log1p(-z) / z
     elif s == 0:
         return 1.0 / (1.0 - z)
     elif s == -1:
