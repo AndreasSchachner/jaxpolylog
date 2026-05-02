@@ -16,7 +16,7 @@ from functools import partial
 
 # Important JAX libraries
 import jax
-from jax import custom_vjp
+from jax import custom_jvp
 from jax import jit, vmap, config
 import jax.numpy as jnp
 from jax import Array
@@ -87,7 +87,7 @@ def intgrand(z: complex, t: complex, s: int) -> complex:
     return jnp.log(t)**(s-1)/(1-z*t) # type: ignore
 
 
-@partial(custom_vjp, nondiff_argnums=(1,2,3,4,))
+@partial(custom_jvp, nondiff_argnums=(1,2,3,4,))
 @partial(jit, static_argnums=(1,2,3,4,))
 def jax_polylog(z: complex, s: int, p_range: int, approx: str, pval: float = _PVAL_OPTIMAL) -> complex: # type: ignore
     r"""
@@ -239,48 +239,143 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str, pval: float = _PV
 
             return Lis_inf * w_inf + Lis_zero * w_zero
 
-def jax_polylog_fwd(z: complex, s: int, p_range: int, approx: str, pval: float) -> tuple:
+def _Li_over_z(z: complex, s: int, p_range: int, approx: str, pval: float) -> complex:
     r"""
     **Description:**
-    Forward pass for the custom VJP of the polylogarithm function.
+    Compute :math:`\mathrm{Li}_s(z)/z` via a numerically stable evaluation that
+    avoids dividing by ``z``.
+
+    This quantity is the analytic derivative
+    :math:`\mathrm{d}/\mathrm{d}z\,\mathrm{Li}_{s+1}(z) = \mathrm{Li}_s(z)/z`
+    used by the JVP rule of :func:`jax_polylog`.  It is mathematically
+    identical to ``jax_polylog(z, s, ...)/z`` but evaluated as either a
+    closed-form polynomial-rational expression (for ``s ≤ 1``) or a
+    re-indexed power series (for ``s ≥ 2`` with ``approx="inf"``).
+    Avoiding the explicit division by ``z`` prevents :math:`1/z^n` factors
+    from cascading through higher-order autodiff and overflowing float64
+    when :math:`|z|` is very small (as happens in LCS-regime period
+    integrals where :math:`|z| = e^{-2\pi q\cdot\mathrm{Im}(t)}` may be
+    :math:`\lesssim 10^{-100}`).
 
     Args:
-        z (complex): The input value(s) at which to evaluate the polylogarithm. Can be a scalar or an array.
-        s (int): The order of the polylogarithm. Must be an integer.
-        p_range (int): The number of terms to include in the series expansion for non-predefined `s` values. Higher values increase accuracy but also computation time.
-        approx (str): The approximation method to use. Must be one of "inf", "integral", "zero", or "patch".
-        pval (float): Transition parameter for the "patch" method (see :func:`jax_polylog`).
+        z (complex): The input value(s).
+        s (int): The order parameter (one less than the order of the parent
+            polylogarithm being differentiated).
+        p_range (int): Number of terms in the series expansion.
+        approx (str): Approximation method.  See :func:`jax_polylog`.
+        pval (float): Transition parameter for the ``"patch"`` method.
 
     Returns:
-        tuple: A tuple containing:
-            - complex: The computed polylogarithm values at the input `z`.
-            - tuple: A tuple of residuals needed for the backward pass.
+        complex: The value :math:`\mathrm{Li}_s(z)/z` evaluated stably.
     """
+    # Closed-form simplifications.  Each entry is the closed-form Li_s(z)
+    # divided by z and algebraically simplified — no division by z remains.
+    if s == 1:
+        # Li_1(z)/z = -log(1-z)/z = sum_{k=1}^{p_range-1} z^{k-1}/k
+        # Hand-extract the k=1 constant term (= 1) and unroll the rest as a
+        # Python loop using `z**(k-1)` with STATIC integer `k-1`.  This
+        # dispatches to ``lax.integer_pow`` whose derivative rule is clean
+        # (does not introduce spurious ``0 * pow(z, -n)`` factors that would
+        # overflow at very small ``z``).
+        result = 1.0 + 0.0 * z   # k=1 term, broadcast to z's shape/dtype
+        for k in range(2, p_range):
+            result = result + z**(k - 1) / float(k)
+        return result
+    elif s == 0:
+        return 1.0 / (1.0 - z)
+    elif s == -1:
+        return 1.0 / (1.0 - z)**2
+    elif s == -2:
+        return (1.0 + z) / (1.0 - z)**3
+    elif s == -3:
+        return (1.0 + 4.0*z + z**2) / (-1.0 + z)**4
+    elif s == -4:
+        return (1.0 + 11.0*z + 11.0*z**2 + z**3) / (1.0 - z)**5
+    elif s == -5:
+        return (1.0 + 26.0*z + 66.0*z**2 + 26.0*z**3 + z**4) / (-1.0 + z)**6
+    elif s == -6:
+        return (1.0 + 57.0*z + 302.0*z**2 + 302.0*z**3 + 57.0*z**4 + z**5) / (1.0 - z)**7
+    elif s == -7:
+        return (1.0 + 120.0*z + 1191.0*z**2 + 2416.0*z**3 + 1191.0*z**4 + 120.0*z**5 + z**6) / (-1.0 + z)**8
+    elif s == -8:
+        return (1.0 + 247.0*z + 4293.0*z**2 + 15619.0*z**3 + 15619.0*z**4 + 4293.0*z**5 + 247.0*z**6 + z**7) / (1.0 - z)**9
+    elif s == -9:
+        return (1.0 + 502.0*z + 14608.0*z**2 + 88234.0*z**3 + 156190.0*z**4 + 88234.0*z**5 + 14608.0*z**6 + 502.0*z**7 + z**8) / (-1.0 + z)**10
+    else:
+        if approx == "inf":
+            # Re-indexed inf-series: Li_s(z)/z = sum_{k=1}^{p_range-1} z^{k-1}/k^s
+            # Hand-extract the k=1 constant term and unroll the rest with
+            # static integer exponents (see the ``s==1`` branch above for
+            # rationale).
+            result = 1.0 + 0.0 * z   # k=1 term, broadcast to z's shape/dtype
+            for k in range(2, p_range):
+                result = result + z**(k - 1) / float(k)**s
+            return result
+        elif approx == "integral":
+            # Li_s(z)/z = (-1)^{s-1}/Γ(s) · ∫₀¹ log(t)^{s-1}/(1-z·t) dt
+            polylog_range = jnp.linspace(0+1e-20, 1., p_range)
+            return ((-1)**(s-1) / jax.scipy.special.gamma(s)
+                    * jax.scipy.integrate.trapezoid(intgrand(z, polylog_range, s),
+                                                    x=polylog_range))
+        elif approx == "zero":
+            # The "zero" expansion is convergent for |log z| < 2π, i.e. z near 1.
+            # In that regime z is not tiny, so dividing by z is safe and the
+            # 1/z^n cascade does not occur.  Use the literal form.
+            return jax_polylog(z, s, p_range, "zero", pval) / z
+        elif approx == "patch":
+            # Mirror the patch logic of jax_polylog itself, but with the
+            # stable re-indexed inf series (static unroll, see notes above).
+            # For tiny |z|, t=|log z|/(2π) is large, the heaviside selects
+            # "inf", so we get the stable series with no /z primitive.  For
+            # z near 1, the "zero" branch is selected and division by z is
+            # safe (z ≠ 0).
+            Lis_inf_over_z = 1.0 + 0.0 * z
+            for k in range(2, p_range):
+                Lis_inf_over_z = Lis_inf_over_z + z**(k - 1) / float(k)**s
+            Lis_zero_over_z = jax_polylog(z, s, p_range, "zero", pval) / z
 
-    # Returns primal output and residuals to be used in backward pass by f_bwd.
-    return jax_polylog(z, s, p_range, approx, pval), (jax_polylog(z, s-1, p_range, approx, pval)/z, 0.+0*0j, 0+0.*0j, 0+0.*0j)
+            mu = jnp.log(z)
+            t  = jnp.abs(mu) / (2.0 * jnp.pi)
 
-def jax_polylog_bwd(s: int, p_range: int, approx: str, pval: float, res: tuple, g: ArrayLike) -> tuple:
+            inside_disk = jnp.heaviside(1.0 - jnp.abs(z), 0.0)
+            prefer_inf  = jnp.heaviside(t - pval, 0.0)
+            w_inf  = inside_disk * prefer_inf
+            w_zero = 1.0 - w_inf
+
+            return Lis_inf_over_z * w_inf + Lis_zero_over_z * w_zero
+
+@jax_polylog.defjvp
+def _jax_polylog_jvp(s: int, p_range: int, approx: str, pval: float, primals: tuple, tangents: tuple) -> tuple:
     r"""
     **Description:**
-    Backward pass for the custom VJP of the polylogarithm function.
+    Forward-mode JVP rule for :func:`jax_polylog`.
+
+    Implements the analytic identity
+
+    .. math::
+        \frac{\mathrm{d}}{\mathrm{d}z}\,\mathrm{Li}_s(z) = \frac{\mathrm{Li}_{s-1}(z)}{z}\,,
+
+    with :math:`\mathrm{Li}_{s-1}(z)/z` evaluated via :func:`_Li_over_z`,
+    a numerically-stable rewriting that avoids dividing by ``z``.  Using
+    ``custom_jvp`` (rather than ``custom_vjp``) also makes
+    :func:`jax.jvp` work directly, and JAX automatically derives the VJP
+    via transposition (the rule is linear in the tangent).
 
     Args:
-        s (int): The order of the polylogarithm. Must be an integer.
-        p_range (int): The number of terms to include in the series expansion for non-predefined `s` values. Higher values increase accuracy but also computation time.
-        approx (str): The approximation method to use. Must be one of "inf", "integral", "zero", or "patch".
-        pval (float): Transition parameter for the "patch" method (see :func:`jax_polylog`).
-        res (tuple): A tuple of residuals from the forward pass.
-        g (ArrayLike): The gradient of the output with respect to some scalar value.
+        s, p_range, approx, pval: nondiff_argnums passed through.
+        primals (tuple): ``(z,)``.
+        tangents (tuple): ``(z_dot,)``.
 
     Returns:
-        tuple: A tuple containing the gradient of the input `z`.
+        tuple: ``(primal_out, tangent_out)`` with
+            ``tangent_out = (Li_{s-1}(z)/z) · z_dot``.
     """
-    # Returns the cotangent of the primal inputs and the residuals from f_fwd.
-    y, _,_,_ = res # Gets residuals computed in f_fwd
-    return ((g * y+0.*0j,))
-
-jax_polylog.defvjp(jax_polylog_fwd, jax_polylog_bwd)
+    z, = primals
+    z_dot, = tangents
+    primal_out  = jax_polylog(z, s, p_range, approx, pval)
+    deriv       = _Li_over_z(z, s - 1, p_range, approx, pval)
+    tangent_out = deriv * z_dot
+    return primal_out, tangent_out
 
 jax_polylog_vmap_tmp = jax.vmap(jax_polylog, in_axes=(0, None, None, None, None))
 

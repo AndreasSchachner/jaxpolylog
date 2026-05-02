@@ -3,7 +3,7 @@ from pathlib import Path
 
 setup(
     name='jaxpolylog',
-    version='0.1.0',
+    version='0.2.0',
     description='JAX-compatible polylogarithm functions with automatic differentiation.',
     long_description=Path('README.md').read_text(encoding='utf-8'),
     long_description_content_type='text/markdown',
