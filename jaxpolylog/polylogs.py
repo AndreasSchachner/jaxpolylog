@@ -28,6 +28,7 @@ from numpy.typing import ArrayLike
 config.update("jax_enable_x64", True)
 
 
+
 # ---------------------------------------------------------------------------
 # Stable coefficient utilities for the ``"zero"`` series expansion.
 # ---------------------------------------------------------------------------
