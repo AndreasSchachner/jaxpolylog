@@ -12,7 +12,9 @@
 
 # Important standard libraries
 import os, sys, warnings
-from functools import partial
+import math
+from fractions import Fraction
+from functools import partial, lru_cache
 
 # Important JAX libraries
 import jax
@@ -24,6 +26,148 @@ from numpy.typing import ArrayLike
 
 # Enable 64 bit precision
 config.update("jax_enable_x64", True)
+
+
+# ---------------------------------------------------------------------------
+# Stable coefficient utilities for the ``"zero"`` series expansion.
+# ---------------------------------------------------------------------------
+# The ``"zero"`` branch evaluates  Li_s(z) = Σ_k ζ(s-k) / k! · μ^k  with
+# μ = log z, which converges for |μ| < 2π.  The kth coefficient is
+# ζ(s-k)/k!.  The old implementation built this via
+#   ``Bs = jax.scipy.special.bernoulli(p_range); zeta_neg = -Bs/k``
+# which overflows fp64 for ``p_range ≳ 250`` because individual
+# Bernoulli numbers grow factorially even though the coefficient
+# B_k / k! we actually need decays geometrically.  The helpers below
+# compute the coefficients without ever materialising large ``B_k`` as
+# floats, using exact :class:`fractions.Fraction` Bernoulli numbers and
+# (where needed) the identity
+#   ζ(2m) = |B_{2m}| · (2π)^{2m} / (2 · (2m)!).
+# All computation happens at module-trace time and is cached.
+
+
+@lru_cache(maxsize=4)
+def _bernoulli_fractions_up_to(N: int) -> tuple:
+    r"""Return ``(B_0, B_1, ..., B_N)`` as :class:`fractions.Fraction`.
+
+    Akiyama–Tanigawa recurrence, exact rationals.  Used by
+    :func:`_zero_branch_coeffs` and :func:`_zeta_pos_int` for stable
+    coefficient construction.  Cached because computation is O(N²) in
+    bignum operations.
+    """
+    a = [Fraction(0)] * (N + 1)
+    B = [Fraction(0)] * (N + 1)
+    for m in range(N + 1):
+        a[m] = Fraction(1, m + 1)
+        for j in range(m, 0, -1):
+            a[j - 1] = j * (a[j - 1] - a[j])
+        B[m] = a[0]
+    return tuple(B)
+
+
+@lru_cache(maxsize=64)
+def _zeta_pos_int(n: int) -> float:
+    r"""Riemann ``ζ(n)`` for integer ``n ≥ 2``, fp64-precise.
+
+    Even ``n``: closed form ``ζ(2m) = |B_{2m}| (2π)^{2m} / (2 · (2m)!)`` from
+    the exact Bernoulli table.  Odd ``n``: direct summation plus a five-term
+    Euler–Maclaurin tail (more than enough for fp64 from K=60 onward).
+    """
+    if n < 2:
+        raise ValueError(f"_zeta_pos_int requires n >= 2, got {n}")
+    if n % 2 == 0:
+        B = _bernoulli_fractions_up_to(n)
+        abs_bn = B[n] if B[n] > 0 else -B[n]
+        ratio = abs_bn / (Fraction(2) * Fraction(math.factorial(n)))
+        return float(ratio) * (2.0 * math.pi) ** n
+    K = 60
+    Kf = float(K)
+    s = sum(1.0 / k ** n for k in range(1, K))
+    s += 1.0 / ((n - 1) * Kf ** (n - 1))
+    s += 0.5 / Kf ** n
+    s += n / (12.0 * Kf ** (n + 1))
+    s -= n * (n + 1) * (n + 2) / (720.0 * Kf ** (n + 3))
+    s += n * (n + 1) * (n + 2) * (n + 3) * (n + 4) / (30240.0 * Kf ** (n + 5))
+    return s
+
+
+# Hard cap on the number of terms used in the "zero" Laurent series.  The
+# series converges geometrically with ratio |μ|/(2π); 200 terms gives
+# truncation error ≤ 0.5^200 ≈ 10^{-60} at the patch threshold |μ|/2π ≈ pval,
+# so any larger ``p_range`` adds no precision but slows the precomputation.
+_ZERO_BRANCH_P_MAX = 200
+
+
+@lru_cache(maxsize=64)
+def _zero_branch_coeffs(s: int, P: int) -> tuple:
+    r"""Precompute ``c[k] = ζ(s-k) / k!`` for ``k = 0..P-1``.
+
+    Branch table:
+
+      * ``arg = s-k ≥ 2``:  ``ζ(arg)`` via :func:`_zeta_pos_int`.
+      * ``arg = 1`` (``k = s-1``):  coefficient set to 0 (cancels the
+        explicit ``log(-μ)`` term in :func:`jax_polylog`).
+      * ``arg = 0`` (``k = s``):    ``ζ(0) = -1/2``.
+      * ``arg < 0``, ``n = 1 - arg``:
+          - ``n`` odd ≥ 3:  ``B_n = 0`` → coefficient = 0.
+          - ``n = 2m`` even:  coefficient ``= -B_{2m}/(2m · k!)`` as an
+            exact :class:`Fraction`, then floated.  Never materialises
+            ``B_{2m}`` or ``k!`` separately.
+    """
+    coeffs = [0.0] * P
+    Bf = _bernoulli_fractions_up_to(max(2, P)) if P > 1 else None
+    for k in range(P):
+        if k == s - 1:
+            continue
+        arg = s - k
+        if arg >= 2:
+            coeffs[k] = _zeta_pos_int(arg) / math.factorial(k)
+        elif arg == 1:
+            continue
+        elif arg == 0:
+            coeffs[k] = -0.5 / math.factorial(k)
+        else:
+            n = 1 - arg
+            if n == 1 or (n % 2 == 1):
+                continue
+            frac = -Bf[n] / (Fraction(n) * Fraction(math.factorial(k)))
+            coeffs[k] = float(frac)
+    return tuple(coeffs)
+
+
+def _Li1_over_z_stable(z):
+    r"""``Li_1(z)/z = -log1p(-z)/z`` evaluated stably under nested autodiff.
+
+    The closed form ``-log1p(-z)/z`` is correct numerically for any ``|z|``,
+    but JAX autodiff cascades produce catastrophic cancellation at small
+    ``|z|`` from the second derivative onward: ``d/dz[-log1p(-z)/z]`` is
+    algebraically ``1/(z(1-z)) + log1p(-z)/z²``, two ``O(1/z)`` terms that
+    cancel mathematically but lose all bits in fp64 for ``|z| ≲ 10⁻²``.
+
+    Cure: at ``|z| < 0.5`` use the convergent power series
+
+    .. math::
+        \frac{\mathrm{Li}_1(z)}{z} \;=\; \sum_{k=0}^{\infty} \frac{z^k}{k+1}
+        \;=\; 1 + \frac{z}{2} + \frac{z^2}{3} + \cdots,
+
+    a polynomial in ``z`` whose JAX autodiff is exact at all orders.  60 terms
+    give truncation error ``|z|^{60} ≤ 0.5^{60} ≈ 10⁻¹⁸`` at the cutoff.  The
+    double-where ensures the inactive branch sees a safe argument so that
+    ``0 · NaN = NaN`` poisoning cannot reach the result.
+    """
+    EPS = 0.5
+    use_series = jnp.abs(z) < EPS
+    SAFE_CLOSED = jnp.asarray(0.7 + 0.0j, dtype=z.dtype)
+    SAFE_SERIES = jnp.asarray(0.3 + 0.0j, dtype=z.dtype)
+    z_series = jnp.where(use_series, z, SAFE_SERIES)
+    z_closed = jnp.where(use_series, SAFE_CLOSED, z)
+
+    series_val = jnp.ones_like(z_series)
+    zk = z_series
+    for k in range(2, 62):
+        series_val = series_val + zk / float(k)
+        zk = zk * z_series
+    closed_val = -jnp.log1p(-z_closed) / z_closed
+    return jnp.where(use_series, series_val, closed_val)
 
 
 def _compute_pval_optimal() -> float:
@@ -185,59 +329,51 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str, pval: float = _PV
             polylog_range = jnp.linspace(0+1e-20,1.,p_range)
             return z*(-1)**(s-1)/jax.scipy.special.gamma(s)*jax.scipy.integrate.trapezoid(intgrand(z,polylog_range,s),x=polylog_range)
         elif approx=="zero":
-            # Use series expansion around z=0
+            # Series expansion around z=1: Li_s(z) = term1 + Σ_k ζ(s-k)/k! · μ^k,
+            # convergent for |μ| < 2π with μ = log z.
+            #
+            # The coefficient table c[k] = ζ(s-k)/k! is precomputed once per
+            # (s, P) by :func:`_zero_branch_coeffs` using exact Bernoulli
+            # numbers (Fraction arithmetic).  This replaces the old
+            # ``jax.scipy.special.bernoulli(p_range)`` call, which overflows
+            # fp64 for ``p_range ≳ 250`` because individual B_n grow
+            # factorially even though the coefficient B_n/n! decays
+            # geometrically.  See :func:`_zero_branch_coeffs` for details.
             mu = jnp.log(z)
-            # Compute harmonic number
-            Hs = jnp.sum(1/jnp.arange(1,s))
-            # First term
-            term1 = (mu)**(s-1)/jax.scipy.special.gamma(s)*(Hs-jnp.log(-mu))
+            Hs = jnp.sum(1.0 / jnp.arange(1, s))
+            term1 = mu ** (s - 1) / jax.scipy.special.gamma(s) * (Hs - jnp.log(-mu))
 
-            # Values of zeta function from s to 2
-            zeta_pos = jax.scipy.special.zeta(s-jnp.arange(0,s-1),q=1)
-            zeta = jnp.append(zeta_pos,jnp.zeros(1))
-
-            # Values of Bernoulli numbers from 1 to p_range
-            Bs = jax.scipy.special.bernoulli(p_range)[1:]
-            # Change convention for B_1
-            Bs = Bs.at[0].set(0.5)
-            # Values of zeta function from 0 to -p_range
-            zneg_range = jnp.arange(1,p_range+1)
-            zeta_neg = -Bs/zneg_range
-
-            # Combine both parts
-            zeta = jnp.append(zeta,zeta_neg)
-            
-            # Set coefficient at s-1 to zero
-            zeta = zeta.at[s-1].set(0.)
-            polylog_range = jnp.arange(0,zeta.shape[0])
-            
-            # Compute coefficients
-            coeffs = zeta/jax.scipy.special.factorial(polylog_range)
-
-            # Compute series
-            term2 = jnp.sum(coeffs*mu**polylog_range)
-            return term1 + term2 # type: ignore
+            P = min(p_range, _ZERO_BRANCH_P_MAX)
+            coeffs = jnp.asarray(_zero_branch_coeffs(s, P))
+            powers = mu ** jnp.arange(P)
+            term2 = jnp.sum(coeffs * powers)
+            return term1 + term2  # type: ignore
         elif approx=="patch":
-            # t = |log z| / (2π): normalised distance from the nearest root of
-            # unity in log-space.  The "zero" expansion converges for t < 1 and
-            # the "inf" series converges for |z| < 1.
+            # Double-where dispatch: both branches must be traced for vmap,
+            # but each branch is *evaluated* on a safe argument when inactive.
+            # This avoids IEEE ``0 · NaN = NaN`` poisoning when one branch
+            # overflows (the "zero" branch at small |z|, where μ^k → huge)
+            # or diverges (the "inf" branch at |z| ≥ 1).
+            #
+            #   |z| < 1  AND  t = |log z|/(2π) ≥ pval   →   "inf"  branch
+            #   otherwise                                 →   "zero" branch
+            #
+            # The safe substitutes (|z|=0.5 for the inf branch, |z|=0.9 for
+            # the zero branch) sit comfortably inside each branch's
+            # convergence basin, so the inactive branch produces a finite
+            # (irrelevant) number that ``jnp.where`` then discards.
             mu = jnp.log(z)
             t  = jnp.abs(mu) / (2.0 * jnp.pi)
+            use_inf = (jnp.abs(z) < 1.0) & (t >= pval)
 
-            Lis_inf  = jax_polylog(z, s, p_range, "inf",  pval)
-            Lis_zero = jax_polylog(z, s, p_range, "zero", pval)
+            SAFE_INF  = jnp.asarray(0.5 + 0.0j, dtype=z.dtype)
+            SAFE_ZERO = jnp.asarray(0.9 + 0.0j, dtype=z.dtype)
+            z_for_inf  = jnp.where(use_inf, z, SAFE_INF)
+            z_for_zero = jnp.where(use_inf, SAFE_ZERO, z)
 
-            # Use "inf" only when BOTH conditions hold:
-            #   (a) |z| < 1  — the "inf" series converges; it diverges for |z| ≥ 1
-            #   (b) t ≥ pval — the "inf" series has smaller truncation error
-            # Everything else (including all points on or outside the unit circle)
-            # falls back to the "zero" expansion.
-            inside_disk = jnp.heaviside(1.0 - jnp.abs(z), 0.0)   # 1 if |z| < 1
-            prefer_inf  = jnp.heaviside(t - pval, 0.0)            # 1 if t ≥ pval
-            w_inf  = inside_disk * prefer_inf
-            w_zero = 1.0 - w_inf
-
-            return Lis_inf * w_inf + Lis_zero * w_zero
+            Lis_inf  = jax_polylog(z_for_inf,  s, p_range, "inf",  pval)
+            Lis_zero = jax_polylog(z_for_zero, s, p_range, "zero", pval)
+            return jnp.where(use_inf, Lis_inf, Lis_zero)
 
 def _Li_over_z(z: complex, s: int, p_range: int, approx: str, pval: float) -> complex:
     r"""
@@ -285,7 +421,13 @@ def _Li_over_z(z: complex, s: int, p_range: int, approx: str, pval: float) -> co
         # as v0.1.0.  In jaxvacua's F_inst chain (parent ``s=3``), only
         # ``_Li_over_z(z, s=2, ...)`` is invoked, so this branch is never
         # hit during higher-order autodiff and the overflow is avoided.
-        return -jnp.log1p(-z) / z
+        #
+        # v0.3.0: route through :func:`_Li1_over_z_stable`, which uses a
+        # 60-term Taylor series at |z|<0.5 so even *direct* high-order
+        # autodiff of Li_2 (or anything that ultimately calls Li_1/z at
+        # small |z|) stays at fp64 precision.  Equivalent to the closed
+        # form at |z|≥0.5, so existing callers see no numerical change.
+        return _Li1_over_z_stable(z)
     elif s == 0:
         return 1.0 / (1.0 - z)
     elif s == -1:
@@ -328,26 +470,25 @@ def _Li_over_z(z: complex, s: int, p_range: int, approx: str, pval: float) -> co
             # 1/z^n cascade does not occur.  Use the literal form.
             return jax_polylog(z, s, p_range, "zero", pval) / z
         elif approx == "patch":
-            # Mirror the patch logic of jax_polylog itself, but with the
-            # stable re-indexed inf series (static unroll, see notes above).
-            # For tiny |z|, t=|log z|/(2π) is large, the heaviside selects
-            # "inf", so we get the stable series with no /z primitive.  For
-            # z near 1, the "zero" branch is selected and division by z is
-            # safe (z ≠ 0).
-            Lis_inf_over_z = 1.0 + 0.0 * z
-            for k in range(2, p_range):
-                Lis_inf_over_z = Lis_inf_over_z + z**(k - 1) / float(k)**s
-            Lis_zero_over_z = jax_polylog(z, s, p_range, "zero", pval) / z
-
+            # Double-where dispatch — mirror of :func:`jax_polylog`'s patch
+            # branch.  Each side sees a safe argument when inactive, so
+            # ``0 · NaN = NaN`` poisoning cannot reach the ``jnp.where``.
+            # The zero branch divides by z, which is safe because the safe
+            # substitute SAFE_ZERO = 0.9 keeps the divisor away from 0.
             mu = jnp.log(z)
             t  = jnp.abs(mu) / (2.0 * jnp.pi)
+            use_inf = (jnp.abs(z) < 1.0) & (t >= pval)
 
-            inside_disk = jnp.heaviside(1.0 - jnp.abs(z), 0.0)
-            prefer_inf  = jnp.heaviside(t - pval, 0.0)
-            w_inf  = inside_disk * prefer_inf
-            w_zero = 1.0 - w_inf
+            SAFE_INF  = jnp.asarray(0.5 + 0.0j, dtype=z.dtype)
+            SAFE_ZERO = jnp.asarray(0.9 + 0.0j, dtype=z.dtype)
+            z_for_inf  = jnp.where(use_inf, z, SAFE_INF)
+            z_for_zero = jnp.where(use_inf, SAFE_ZERO, z)
 
-            return Lis_inf_over_z * w_inf + Lis_zero_over_z * w_zero
+            Lis_inf_over_z = 1.0 + 0.0 * z_for_inf
+            for k in range(2, p_range):
+                Lis_inf_over_z = Lis_inf_over_z + z_for_inf ** (k - 1) / float(k) ** s
+            Lis_zero_over_z = jax_polylog(z_for_zero, s, p_range, "zero", pval) / z_for_zero
+            return jnp.where(use_inf, Lis_inf_over_z, Lis_zero_over_z)
 
 @jax_polylog.defjvp
 def _jax_polylog_jvp(s: int, p_range: int, approx: str, pval: float, primals: tuple, tangents: tuple) -> tuple:
