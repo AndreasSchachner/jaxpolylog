@@ -1,0 +1,14 @@
+Sphinx>=7.0
+sphinx-book-theme
+sphinx-copybutton
+sphinx-autodoc-typehints
+sphinx_togglebutton
+sphinx_design
+myst-nb
+matplotlib
+mpmath
+tqdm
+Pygments
+numpy
+jax
+jaxlib

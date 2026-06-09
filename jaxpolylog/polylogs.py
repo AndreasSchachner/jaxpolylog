@@ -1,8 +1,20 @@
 # ==============================================================================
-# This code is written by Andreas Schachner. Without the author's permission, this code must not be shared with anyone else or used for any other projects than those involving the author directly.
+# Copyright 2022-2026 Andreas Schachner
 #
-# If any questions arise, please feel free to reach out to me (Andreas) either at
-# andreas.schachner@gmx.net or at as3475@cornell.edu or at a.schachner@lmu.de.
+# This file is part of jaxpolylog.
+#
+# jaxpolylog is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# jaxpolylog is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with jaxpolylog. If not, see <https://www.gnu.org/licenses/>.
 # ==============================================================================
 #
 # ------------------------------------------------------------------------------
@@ -282,7 +294,7 @@ def jax_polylog(z: complex, s: int, p_range: int, approx: str, pval: float = _PV
     **Example Usage:**
     ```python
     import jax.numpy as jnp
-    from jaxvacua.polylogs import jax_polylog as polylog
+    from jaxpolylog import jax_polylog as polylog
     z = jnp.array([0.5, 0.9, 1.0])
     s = 2
     result = polylog(z, s, p_range=1000)
@@ -419,9 +431,7 @@ def _Li_over_z(z: complex, s: int, p_range: int, approx: str, pval: float) -> co
         # ``|z|`` the value is fine (``log1p(-z) ≈ -z``, so the ratio is ≈ 1),
         # but JAX's auto-diff of ``-log1p(-z)/z`` cascades ``1/z``, ``1/z²``
         # at higher orders and overflows when ``|z|`` is tiny — same regime
-        # as v0.1.0.  In jaxvacua's F_inst chain (parent ``s=3``), only
-        # ``_Li_over_z(z, s=2, ...)`` is invoked, so this branch is never
-        # hit during higher-order autodiff and the overflow is avoided.
+        # as v0.1.0.  
         #
         # v0.3.0: route through :func:`_Li1_over_z_stable`, which uses a
         # 60-term Taylor series at |z|<0.5 so even *direct* high-order
